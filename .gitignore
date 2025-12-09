@@ -2,3 +2,5 @@
 /build
 *.gcov
 /coverage/
+
+NCCL_SimpleC_proto_fix_codex_instructions.md
