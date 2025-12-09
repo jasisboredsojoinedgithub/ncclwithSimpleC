@@ -175,7 +175,9 @@ def enumerate_func_rows():
     for redop in all_redops:
       for ty in all_tys:
         for algo in algos:
-          for proto in all_protos:
+          # Enable SimpleC for Reduce only (matches P2P SimpleC switch)
+          protos = (all_protos + ["SIMPLEC"]) if coll == "Reduce" else all_protos
+          for proto in protos:
             yield (coll, redop, ty, algo, proto)
 
 ################################################################################
