@@ -171,3 +171,12 @@ struct RunWorkBatch<ncclFuncSendRecv, T, RedOp, NCCL_ALGO_RING, NCCL_PROTO_SIMPL
     }
   }
 };
+
+template<typename T, typename RedOp>
+struct RunWorkBatch<ncclFuncSendRecv, T, RedOp, NCCL_ALGO_RING, NCCL_PROTO_SIMPLEC> {
+  static_assert(sizeof(T)==1, "SendRecv only works on single byte types T.");
+  __device__ __forceinline__ void run() {
+    // Delegate to the SIMPLE implementation
+    RunWorkBatch<ncclFuncSendRecv, T, RedOp, NCCL_ALGO_RING, NCCL_PROTO_SIMPLE>().run();
+  }
+};

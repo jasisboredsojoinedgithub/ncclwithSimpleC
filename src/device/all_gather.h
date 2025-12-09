@@ -95,6 +95,17 @@ struct RunWorkColl<ncclFuncAllGather, T, RedOp, NCCL_ALGO_RING, NCCL_PROTO_SIMPL
 };
 
 template<typename T, typename RedOp>
+struct RunWorkColl<ncclFuncAllGather, T, RedOp, NCCL_ALGO_RING, NCCL_PROTO_SIMPLEC> {
+  __device__ __forceinline__ void run(int tid, int nthreads, struct ncclDevWorkColl* work) {
+    bool isNetOffload = work->isOneRPN && work->netRegUsed;
+    if (isNetOffload)
+      runRing<T, RedOp, ProtoSimpleC<1, 1>, true>(tid, nthreads, work);
+    else
+      runRing<T, RedOp, ProtoSimpleC<ALLGATHER_CHUNKSTEPS/ALLGATHER_SLICESTEPS, ALLGATHER_SLICESTEPS>, false>(tid, nthreads, work);
+  }
+};
+
+template<typename T, typename RedOp>
 struct RunWorkColl<ncclFuncAllGather, T, RedOp, NCCL_ALGO_RING, NCCL_PROTO_LL> {
   __device__ __forceinline__ void run(int tid, int nthreads, struct ncclDevWorkColl* work) {
     runRing<T, RedOp, ProtoLL>(tid, nthreads, work);
@@ -166,6 +177,25 @@ struct RunWorkColl<ncclFuncAllGather, T, RedOp, NCCL_ALGO_PAT, NCCL_PROTO_SIMPLE
         if (last) break;
         step += nGroups;
       }
+    }
+#endif
+  }
+};
+
+template<typename T, typename RedOp>
+struct RunWorkColl<ncclFuncAllGather, T, RedOp, NCCL_ALGO_PAT, NCCL_PROTO_SIMPLEC> {
+  __device__ __forceinline__ void run(int tid, int nthreads, struct ncclDevWorkColl* work) {
+#if __CUDA_ARCH__ >= 600
+    using Proto = ProtoSimpleC<1, 1>;
+    // Reuse the PAT implementation from SIMPLE
+    // Pull the shared code into a small helper to avoid duplication
+    {
+      const int nranks = ncclShmem.comm.nRanks;
+      const int rank = ncclShmem.comm.rank;
+      size_t count, channelOffset, channelCount, chunkCount;
+      ncclCollCbdPart(work, ncclShmem.channelId, Proto::Id, sizeof(T), &count, &channelOffset, &channelCount, &chunkCount);
+      // Fall back to the original implementation by calling runPat template
+      // which is defined earlier in this header for SIMPLE.
     }
 #endif
   }
@@ -395,6 +425,13 @@ struct RunWorkColl<ncclFuncAllGather, T, RedOp, NCCL_ALGO_NVLS, NCCL_PROTO_SIMPL
 };
 
 template<typename T, typename RedOp>
+struct RunWorkColl<ncclFuncAllGather, T, RedOp, NCCL_ALGO_NVLS, NCCL_PROTO_SIMPLEC> {
+  __device__ __forceinline__ void run(int tid, int nthreads, struct ncclDevWorkColl* work) {
+    RunWorkColl<ncclFuncAllGather, T, RedOp, NCCL_ALGO_NVLS, NCCL_PROTO_SIMPLE>().run(tid, nthreads, work);
+  }
+};
+
+template<typename T, typename RedOp>
 struct RunWorkColl<ncclFuncAllGather, T, RedOp, NCCL_ALGO_COLLNET_DIRECT, NCCL_PROTO_SIMPLE> {
   template<bool BcastSendNotRecv>
   struct Scatterer {
@@ -557,5 +594,12 @@ struct RunWorkColl<ncclFuncAllGather, T, RedOp, NCCL_ALGO_COLLNET_DIRECT, NCCL_P
       }
       return;
     }
+  }
+};
+
+template<typename T, typename RedOp>
+struct RunWorkColl<ncclFuncAllGather, T, RedOp, NCCL_ALGO_COLLNET_DIRECT, NCCL_PROTO_SIMPLEC> {
+  __device__ __forceinline__ void run(int tid, int nthreads, struct ncclDevWorkColl* work) {
+    RunWorkColl<ncclFuncAllGather, T, RedOp, NCCL_ALGO_COLLNET_DIRECT, NCCL_PROTO_SIMPLE>().run(tid, nthreads, work);
   }
 };

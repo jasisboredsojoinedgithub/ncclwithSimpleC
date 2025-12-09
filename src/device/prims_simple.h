@@ -5,6 +5,7 @@
  ************************************************************************/
 
 #include "network/unpack/unpack.h"
+#include "codec_cuszp_inline.cuh"
 #include <cassert>
 
 enum primsMode {
@@ -12,6 +13,46 @@ enum primsMode {
   primsModePatRs = 1,
   primsModePatAg = 2
 };
+
+// SimpleC enablement helper: decide purely from compile-time Proto
+// Avoid reading ncclShmem.comm which has no proto field on device.
+template <typename T, typename ProtoT>
+__device__ __forceinline__ bool simplecEnabled() {
+  // Enable only when compiling SimpleC kernels, and only for 8-bit types.
+  return (ProtoT::Id == NCCL_PROTO_SIMPLEC) && (sizeof(T) == 1);
+}
+
+namespace {
+  template <typename T>
+  __device__ __forceinline__
+  size_t simplec_try_encode_to_fifo(const T* srcElems,
+                                    size_t   elemCount,
+                                    uint8_t* dstFifo,
+                                    size_t   dstCapBytes) {
+    using namespace cuszp_inline;
+    const uint32_t rawBytes = (uint32_t)(elemCount * sizeof(T));
+    StepEncodeResult r = step_encode<T>(srcElems, rawBytes, dstFifo, (uint32_t)dstCapBytes, CODEC_BLOCKL);
+    if (r.status == CODEC_OK_COMPRESSED) {
+      return sizeof(CodecHdrV1) + (size_t)r.cmpBytes;
+    }
+    // Do not accept RAW_FALLBACK here since header+raw would exceed cap (cap==rawBytes)
+    return 0;
+  }
+
+  template <typename T>
+  __device__ __forceinline__
+  bool simplec_maybe_decode_from_fifo(const uint8_t* fifoBase, T* dstElems, size_t dstElemCap) {
+    using namespace cuszp_inline;
+    const CodecHdrV1* hdr = (const CodecHdrV1*)fifoBase;
+    if (hdr->magic != CODEC_MAGIC) return false;
+    const size_t rawBytes = hdr->rawBytes;
+    if (rawBytes/sizeof(T) > dstElemCap) return false;
+    step_decode<T>((const uint8_t*)fifoBase, dstElems);
+    return true;
+  }
+}
+
+// SimpleC integration helpers can be added here in a future pass.
 
 template<typename T, typename RedOp, typename Fan, int Direct,
          int SlicePerChunk, int StepPerSlice, int Unroll, int P2p, int MultimemSrcs, int MultimemDsts, bool isNetOffload>
@@ -148,6 +189,11 @@ class Primitives<
         } else {
           ptrs[index] = connEltsFifo + (step%NCCL_STEPS)*connStepSize;
         }
+        // Reserve header space for SimpleC payloads in non-Direct mode
+        if (simplecEnabled<T, ProtoSimple<SlicePerChunk, StepPerSlice, Unroll, MultimemSrcs, MultimemDsts>>() && !(flags & (DirectWrite|DirectRead))) {
+          int headerElems = (int)((sizeof(cuszp_inline::CodecHdrV1)+sizeof(T)-1)/sizeof(T));
+          ptrs[index] = (T*)((char*)ptrs[index] + headerElems*sizeof(T));
+        }
       } else if (!isSendNotRecv && DirectRecv) {
         if (flags & DirectRead) {
           ptrs[index] = directBuff + srcIx + offset;
@@ -156,11 +202,19 @@ class Primitives<
         } else {
           ptrs[index] = connEltsFifo + (step%NCCL_STEPS)*connStepSize;
         }
+        if (simplecEnabled<T, ProtoSimple<SlicePerChunk, StepPerSlice, Unroll, MultimemSrcs, MultimemDsts>>() && !(flags & (DirectWrite|DirectRead))) {
+          int headerElems = (int)((sizeof(cuszp_inline::CodecHdrV1)+sizeof(T)-1)/sizeof(T));
+          ptrs[index] = (T*)((char*)ptrs[index] + headerElems*sizeof(T));
+        }
       }
       else {
         // Yes, for some template arguments this code will be unreachable.  That's fine.
         // coverity[dead_error_line]
         ptrs[index] = connEltsFifo + (step%NCCL_STEPS)*connStepSize;
+        if (simplecEnabled<T, ProtoSimple<SlicePerChunk, StepPerSlice, Unroll, MultimemSrcs, MultimemDsts>>()) {
+          int headerElems = (int)((sizeof(cuszp_inline::CodecHdrV1)+sizeof(T)-1)/sizeof(T));
+          ptrs[index] = (T*)((char*)ptrs[index] + headerElems*sizeof(T));
+        }
       }
       if (flags & NetDeviceUnpack) {
         ncclNetDeviceIncrementHead(group, index);
@@ -238,6 +292,10 @@ class Primitives<
         /* if user abort the kernel, we don't need to actually perform copy/reduce; just set size
          * to 0 to avoid unnecessary workload. */
         int workSize = ncclShmem.aborted ? 0 : sliceSize;
+        if (simplecEnabled<T, ProtoSimple<SlicePerChunk, StepPerSlice, Unroll, MultimemSrcs, MultimemDsts>>()) {
+          int headerElems = (int)((sizeof(cuszp_inline::CodecHdrV1)+sizeof(T)-1)/sizeof(T));
+          workSize = workSize > headerElems ? (workSize - headerElems) : 0;
+        }
         if (flags & AnyNetDeviceUnpack) {
           ncclNetDeviceUnpack<Recv>(tid, tidInBlock, nworkers, group, ncclShmem.groups[group].devicePlugin.unpack.unpackNetDeviceIndexMask, Src, workSize);
           // Sync here to make sure all workers are reading from the updated srcs)
@@ -264,6 +322,17 @@ class Primitives<
              Dst, ncclShmem.groups[group].dsts,
              workSize);
         } else if (ncclShmem.groups[group].srcs[0] && ncclShmem.groups[group].dsts[0]) {
+          // SimpleC pure recv: decode compressed payload directly into user output
+          if (simplecEnabled<T, ProtoSimple<SlicePerChunk, StepPerSlice, Unroll, MultimemSrcs, MultimemDsts>>() && (flags & RoleWaitRecv) && !(flags & RoleWaitSend) && !(flags & (DirectWrite|DirectRead))) {
+            void* src0 = ncclShmem.groups[group].srcs[0]; // payload pointer
+            void* dst0 = ncclShmem.groups[group].dsts[0]; // user output
+            int headerElems = (int)((sizeof(cuszp_inline::CodecHdrV1)+sizeof(T)-1)/sizeof(T));
+            uint8_t* payloadPtr = (uint8_t*)src0;
+            auto* hdr = (cuszp_inline::CodecHdrV1*)(payloadPtr - headerElems*sizeof(T));
+            cuszp_inline::decode_simplec(payloadPtr, hdr, (uint8_t*)dst0);
+            // Skip baseline copy since data is already decoded into user buffer
+            workSize = 0;
+          }
           constexpr int PreOpSrcs = SrcBuf != Input ? 0 :
                                     DirectRecv*MaxRecv == NCCL_MAX_DIRECT_ARITY ? (1+NCCL_MAX_DIRECT_ARITY) : 1;
           if (Send && Dst && ncclShmem.groups[group].dsts[1] == nullptr) {
@@ -290,6 +359,20 @@ class Primitives<
           // skip data flush.
           workSize = 0;
         }
+        // Encode header+payload in-place for SimpleC send roles (non-Direct)
+        if (simplecEnabled<T, ProtoSimple<SlicePerChunk, StepPerSlice, Unroll, MultimemSrcs, MultimemDsts>>() && (flags & RolePostSend) && !(flags & (DirectWrite|DirectRead))) {
+          void* dst0 = ncclShmem.groups[group].dsts[0];
+          if (dst0 != nullptr) {
+            int headerElems = (int)((sizeof(cuszp_inline::CodecHdrV1)+sizeof(T)-1)/sizeof(T));
+            uint8_t* payloadPtr = (uint8_t*)dst0;
+            uint8_t* hdrPtr     = payloadPtr - headerElems*sizeof(T);
+            auto* hdr           = (cuszp_inline::CodecHdrV1*)hdrPtr;
+            const int rawBytes    = workSize * (int)sizeof(T);
+            const int outCapBytes = rawBytes; // capacity equals payload region
+            (void)cuszp_inline::encode_simplec(payloadPtr, rawBytes, payloadPtr, outCapBytes, hdr);
+          }
+        }
+
         barrier(); // This barrier has a counterpart in following loop
         postPeer<Recv, Send>(0 < workSize);
         offset += sliceSize;

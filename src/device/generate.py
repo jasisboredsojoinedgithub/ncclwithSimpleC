@@ -7,7 +7,11 @@ import shutil
 all_colls =  ["Broadcast","Reduce","AllGather","ReduceScatter","AllReduce","SendRecv"]
 all_redops = ["Sum","Prod","MinMax","PreMulSum","SumPostDiv"]
 all_tys =    ["i8","u8","i32","u32","i64","u64","f16","f32","f64","bf16","f8e4m3","f8e5m2"]
+# Global protocol list used for collectives. Do NOT include SIMPLEC here.
 all_protos = ["LL","LL128","SIMPLE"]
+
+# Protocols used only for P2P (send/recv). Keep SimpleC enabled here.
+protos_p2p = ["SIMPLE", "SIMPLEC"]
 all_algos =  ["TREE","RING","COLLNET_DIRECT","COLLNET_CHAIN","NVLS","NVLS_TREE","PAT"]
 
 ################################################################################
@@ -106,7 +110,7 @@ def required_cuda(coll, redop, ty, algo, proto):
   # kernels mapped to by coll="Nop" functions have coll="Generic"
   if coll in ("SendRecv", "Generic", "Nop"): return (cudart, arch)
 
-  if proto!="SIMPLE" and algo not in ("RING","TREE"): return None
+  if proto not in ("SIMPLE","SIMPLEC") and algo not in ("RING","TREE"): return None
 
   if coll in ("AllReduce","Reduce","ReduceScatter"):
     if redop=="SumPostDiv" and ty[0] not in ("i","u"): return None
@@ -146,7 +150,8 @@ def best_kernel(coll, redop, ty, algo, proto):
   def best(coll, redop, ty, algo, proto):
     # Modify this logic to control how many kernels are specialized.
     if coll=="Nop": return ("Generic", None, None, None, None)
-    if coll=="SendRecv": return ("SendRecv", None, None, None, None)
+    # For P2P, specialize kernel against SIMPLE proto; SIMPLEC delegates.
+    if coll=="SendRecv": return ("SendRecv", None, None, None, "SIMPLE")
     if coll in ("AllGather","Broadcast"): return (coll, None, None, "RING", "LL")
     return (coll, "Sum", ty, ("TREE" if algo=="TREE" else "RING"), "LL")
   # Need to ensure kernel is specialize for a primary function
@@ -157,7 +162,9 @@ def best_kernel(coll, redop, ty, algo, proto):
 
 # Order rows are enumerated must match formula of `ncclDevFuncId()`:
 def enumerate_func_rows():
-  yield ("SendRecv", None, None, None, None)
+  # P2P ops: enumerate only SIMPLE and SIMPLEC to keep compression on P2P
+  for proto in protos_p2p:
+    yield ("SendRecv", None, None, None, proto)
   for coll in ("AllGather", "Broadcast"):
     algos = algos_of_coll[coll]
     for algo in algos:

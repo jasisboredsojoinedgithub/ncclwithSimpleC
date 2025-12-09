@@ -42,6 +42,25 @@ struct ProtoSimple {
   static constexpr int MaxGroupWidth = 2;
 };
 
+// SimpleC protocol mirrors Simple parameters but uses a distinct protocol Id
+template<int SlicePerChunk_1, int StepPerSlice_1, int Unroll_1 = COLL_UNROLL, int MultimemSrcs_1 = 0, int MultimemDsts_1 = 0>
+struct ProtoSimpleC {
+  static constexpr int Id = NCCL_PROTO_SIMPLEC;
+  static constexpr int SlicePerChunk = SlicePerChunk_1;
+  static constexpr int StepPerSlice = StepPerSlice_1;
+  static constexpr int Unroll = Unroll_1;
+  static constexpr int MultimemSrcs = MultimemSrcs_1;
+  static constexpr int MultimemDsts = MultimemDsts_1;
+
+  __device__ static int calcBytePerStep() {
+    return ncclShmem.comm.buffSizes[NCCL_PROTO_SIMPLEC]/NCCL_STEPS;
+  }
+  __device__ static int calcBytePerGrain() {
+    return sizeof(uint64_t);
+  }
+  static constexpr int MaxGroupWidth = 2;
+};
+
 struct ProtoLL {
   static constexpr int Id = NCCL_PROTO_LL;
 
